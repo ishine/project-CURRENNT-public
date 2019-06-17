@@ -299,6 +299,107 @@ namespace {
 	}
     };
 
+    struct instantaneousPhaseDistance_step1
+    {
+	int fftBins;
+	complex_t* source;
+	complex_t* target;
+	
+	__host__ __device__ void operator() (const thrust::tuple<complex_t &,
+					     complex_t &, complex_t &, int> &t) const
+	{
+	    // Calcualte and store the phase
+	    // t.get<0>() source
+	    // t.get<1>() target
+	    // t.get<2>() buffer to store diff
+	    // t.get<3>() index
+	    
+	    real_t src_phase_diff = atan2(source[t.get<3>()].y, source[t.get<3>()].x) -
+		atan2(source[t.get<3>() - fftBins].y, source[t.get<3>() - fftBins].x);
+	    real_t tar_phase_diff = atan2(target[t.get<3>()].y, target[t.get<3>()].x) -
+		atan2(target[t.get<3>() - fftBins].y, target[t.get<3>() - fftBins].x);
+	    
+	    real_t ddmod_src = fmod(src_phase_diff + FFT_PI_DEFINITION, 2.0 * FFT_PI_DEFINITION) -
+		FFT_PI_DEFINITION;
+	    real_t ddmod_tar = fmod(tar_phase_diff + FFT_PI_DEFINITION, 2.0 * FFT_PI_DEFINITION) -
+		FFT_PI_DEFINITION;
+
+	    if (abs(ddmod_src + FFT_PI_DEFINITION) < FFT_AMP_MIN_NUM && src_phase_diff > 0)
+		ddmod_src = FFT_PI_DEFINITION;
+	    if (abs(ddmod_tar + FFT_PI_DEFINITION) < FFT_AMP_MIN_NUM && tar_phase_diff > 0)
+		ddmod_tar = FFT_PI_DEFINITION;
+			    
+	    t.get<2>().x = ddmod_src - src_phase_diff;
+	    t.get<2>().y = ddmod_tar - tar_phase_diff;
+	    
+	    if (src_phase_diff < 0)
+		t.get<2>().x = 0;
+	    if (tar_phase_diff < 0)
+		t.get<2>().y = 0;
+	    
+	}
+    };
+
+    
+    
+    struct instantaneousPhaseDistance_step2
+    {
+	int fftBins;
+	int validFrameNum;
+	complex_t* phaseOff;
+	
+	__host__ __device__ void operator() (const thrust::tuple<complex_t &, int> &t) const
+	{
+	    
+	    for (int i = 1; i<validFrameNum; i++){
+		phaseOff[ i * fftBins + t.get<1>()].x = phaseOff[ i * fftBins + t.get<1>()].x +
+		    phaseOff[ (i-1) * fftBins + t.get<1>()].x;
+		phaseOff[ i * fftBins + t.get<1>()].y = phaseOff[ i * fftBins + t.get<1>()].y +
+		    phaseOff[ (i-1) * fftBins + t.get<1>()].y;
+	    }
+	    
+	}
+    };
+
+    struct instantaneousPhaseDistance_step3
+    {
+	int fftBins;	
+	complex_t* source;
+	complex_t* target;
+	complex_t* phaseOff;
+	
+	__host__ __device__ void operator() (const thrust::tuple<complex_t &, complex_t &,
+					     complex_t &, int> &t) const
+	{
+	    // Calcualte and store the phase
+	    // t.get<0>() diff
+
+	    // source - target
+	    real_t src_phase_off_cur = phaseOff[t.get<3>()].x;
+	    real_t tar_phase_off_cur = phaseOff[t.get<3>()].y;
+	    
+	    real_t src_phase_off_pre = phaseOff[t.get<3>() - fftBins].x;
+	    real_t tar_phase_off_pre = phaseOff[t.get<3>() - fftBins].y;
+
+	    // source
+	    t.get<2>().y = 
+		atan2(source[t.get<3>()].y, source[t.get<3>()].x) + src_phase_off_cur -
+		atan2(source[t.get<3>() - fftBins].y, source[t.get<3>() - fftBins].x) -
+		src_phase_off_pre;
+	    
+	    // target
+	    t.get<2>().x =
+		atan2(target[t.get<3>()].y, target[t.get<3>()].x) + tar_phase_off_cur -
+		atan2(target[t.get<3>() - fftBins].y, target[t.get<3>() - fftBins].x) -
+		tar_phase_off_pre;
+
+	    //return;
+	    t.get<2>().y = t.get<2>().y - t.get<2>().x;
+	    
+	    // (source - target) ^ 2
+	    t.get<2>().x = t.get<2>().y * t.get<2>().y;
+	}
+    };
 
     struct L2DistanceGrad
     {
@@ -352,6 +453,33 @@ namespace {
 			   FFT_KLD_FLOOR_NUM);
 	    
 	    real_t fac  = (t.get<0>().y * t.get<1>().x - t.get<0>().x * t.get<1>().y) / t.get<2>().y;
+	    t.get<2>().x = fac * (-1.0) * t.get<0>().y / spec;
+	    t.get<2>().y = fac * t.get<0>().x / spec;
+	    
+	}
+    };
+
+    struct instantaneousPhaseGrad
+    {
+	int fftBins;
+	complex_t* diffData;
+
+	__host__ __device__ void operator() (const thrust::tuple<complex_t &,
+					     complex_t &, complex_t &, int> &t) const
+	{
+	    // t.get<0>() source
+	    // t.get<1>() target
+	    // t.get<2>() buffer to store diff
+	    // t.get<3>() data index
+	    
+	    real_t spec = (t.get<0>().x * t.get<0>().x +
+			   t.get<0>().y * t.get<0>().y +
+			   FFT_KLD_FLOOR_NUM);
+	    
+	    //   \widehat{Phase}(m,n) - \widehat{Phase}(m-1,n) - {Phase}(m,n) + {Phase}(m-1,n)
+	    // - (\widehat{Phase}(m+1,n) - \widehat{Phase}(m,n) - {Phase}(m+1,n) + {Phase}(m,n))
+	    real_t fac  = diffData[t.get<3>()].y - diffData[t.get<3>() + fftBins].y;
+	    
 	    t.get<2>().x = fac * (-1.0) * t.get<0>().y / spec;
 	    t.get<2>().y = fac * t.get<0>().x / spec;
 	    
@@ -413,7 +541,6 @@ namespace {
 	}
     };
 
-    
 }
 }
 
@@ -461,7 +588,7 @@ namespace helpers {
 	, m_batchSize       (batchSize)
 	, m_signalBufLength (signalBufLength)
 	, m_signalLength    (signalLength)
-	, m_specDisType     (specDisType)
+	, m_disType     (specDisType)
 	  
     {
 	// m_windowType is not implemented for windows other than Hann
@@ -495,7 +622,7 @@ namespace helpers {
 	, m_frameLength  (-1)
 	, m_signalLength (-1)
 	, m_batchSize    (batchSize)
-	, m_specDisType  (0)
+	, m_disType  (0)
     {
 	// check?
     }
@@ -588,7 +715,7 @@ namespace helpers {
 	if (this->m_fftData->size() != target.m_fftData->size())
 	    throw std::runtime_error("FFTL2Distance error: input fft data unequal size");
 	
-	if (m_specDisType == FFTMAT_SPECTYPE_KLD){
+	if (m_disType == FFTMAT_SPECTYPE_KLD){
 	    {
 		internal::SpecKLD fn1;
 		thrust::for_each(
@@ -640,7 +767,105 @@ namespace helpers {
 	if (this->m_fftData->size() != target.m_fftData->size())
 	    throw std::runtime_error("FFTL2Distance error: input fft data unequal size");
 	
-	{
+	// Phase-distance averaged over (frameNum * fftBins)
+	real_t distance = 0.0;
+	
+	
+	if (m_disType == FFTMAT_PHASETYPE_INTANT){
+	    if (m_validFrameNum <= 2)
+		return distance;
+	    
+	    complex_t tmp;
+	    tmp.x = 0;
+	    tmp.y = 0;
+	    thrust::fill((*diff.m_fftData).begin(), (*diff.m_fftData).end(), tmp);
+	    
+	    // Step1. calculate phase_shift for unwrap
+	    {
+		internal::instantaneousPhaseDistance_step1 fn1;
+		fn1.fftBins = m_fftBins;
+		fn1.source = helpers::getRawPointer(*m_fftData);
+		fn1.target = helpers::getRawPointer(*(target.m_fftData));
+		
+		thrust::for_each(
+			thrust::make_zip_iterator(
+				thrust::make_tuple(
+					(*m_fftData).begin()          + m_fftBins,
+					(*(target.m_fftData)).begin() + m_fftBins,
+					(*(diff.m_fftData)).begin()   + m_fftBins,
+					thrust::counting_iterator<int>(0) + m_fftBins)),
+			thrust::make_zip_iterator(
+				thrust::make_tuple(
+					(*m_fftData).end(),
+					(*(target.m_fftData)).end(),
+					(*(diff.m_fftData)).end(),
+					thrust::counting_iterator<int>(0) + this->m_fftData->size())),
+			fn1);
+	    }
+	    
+	    // Step2. calculate phase_shift.cumsum
+	    {
+		internal::instantaneousPhaseDistance_step2 fn1;
+		fn1.fftBins  = m_fftBins;
+		fn1.validFrameNum = m_validFrameNum;
+		fn1.phaseOff = helpers::getRawPointer(*(diff.m_fftData));
+		
+		thrust::for_each(
+			thrust::make_zip_iterator(
+				thrust::make_tuple(
+					(*(diff.m_fftData)).begin(),
+					thrust::counting_iterator<int>(0))),
+			thrust::make_zip_iterator(
+				thrust::make_tuple(
+					(*(diff.m_fftData)).begin()       + m_fftBins,
+					thrust::counting_iterator<int>(0) + m_fftBins)),
+			fn1);
+	    }
+
+	    complex_vector phaseOff = (*diff.m_fftData);
+	    
+	    // Step3. unwrap and calculate diff(phase) in diff.m_fftData.x y
+	    {
+		internal::instantaneousPhaseDistance_step3 fn1;
+		fn1.fftBins = m_fftBins;
+		fn1.source = helpers::getRawPointer(*m_fftData);
+		fn1.target = helpers::getRawPointer(*(target.m_fftData));
+		fn1.phaseOff = helpers::getRawPointer(phaseOff);
+		
+		thrust::for_each(
+		     thrust::make_zip_iterator(
+			  thrust::make_tuple(
+				(*m_fftData).begin()              + m_fftBins,
+				(*(target.m_fftData)).begin()     + m_fftBins,
+				(*(diff.m_fftData)).begin()       + m_fftBins,
+				thrust::counting_iterator<int>(0) + m_fftBins)),
+		     thrust::make_zip_iterator(
+			  thrust::make_tuple(
+				(*m_fftData).begin()              + m_validFrameNum * m_fftBins,
+				(*(target.m_fftData)).begin()     + m_validFrameNum * m_fftBins,
+				(*(diff.m_fftData)).begin()       + m_validFrameNum * m_fftBins,
+				thrust::counting_iterator<int>(0) + m_validFrameNum * m_fftBins)),
+			fn1);
+		
+	    }	    
+	    
+	    // sum the distance
+	    {
+		internal::getError fn2;
+		fn2.factor = fftTools::fftBinsNum(m_fftLength) * (m_validFrameNum - 2);
+		distance = thrust::transform_reduce(
+				(*(diff.m_fftData)).begin() + m_fftBins,
+				(*(diff.m_fftData)).begin() + m_fftBins + (int)fn2.factor,
+				fn2,
+				(real_t)0,
+				thrust::plus<real_t>());
+		if (distance != distance)
+		    return 0.0;
+	    }
+	    
+	}else{
+	    
+	    // default cos distance
 	    {
 		internal::phaseDistance fn1;
 		thrust::for_each(
@@ -654,11 +879,9 @@ namespace helpers {
 					   (*(diff.m_fftData)).end())),
 		fn1);
 	    }
-	}
-
-	// Phase-distance averaged over (frameNum * fftBins)
-	real_t distance = 0.0;
-	{{
+	    
+	    // sum the distance
+	    {
 		internal::getError fn2;
 		//fn2.factor = 1.0/this->m_fftData->size();
 		fn2.factor = fftTools::fftBinsNum(m_fftLength) * m_validFrameNum;
@@ -667,7 +890,9 @@ namespace helpers {
 						    fn2,
 						    (real_t)0,
 						    thrust::plus<real_t>());
-	}}
+	    }
+	}
+
 	return distance;
     }
 
@@ -677,7 +902,7 @@ namespace helpers {
     {
 
 	// calculate the gradient at each frequency bin and each time step
-	if (m_specDisType == FFTMAT_SPECTYPE_KLD){
+	if (m_disType == FFTMAT_SPECTYPE_KLD){
 	    {
 		internal::SpecKLDGrad fn1;
 		thrust::for_each(
@@ -712,8 +937,40 @@ namespace helpers {
     template <typename TDevice>
     void FFTMat<TDevice>::specPhaseGrad(FFTMat<TDevice> &source, FFTMat<TDevice> &target)
     {
+	
+	if (m_disType == FFTMAT_PHASETYPE_INTANT){
+	    if (m_validFrameNum <= 2)
+		return;
 
-	{
+	    {
+		internal::instantaneousPhaseGrad fn1;
+		fn1.fftBins = m_fftBins;
+		fn1.diffData = helpers::getRawPointer(*m_fftData);
+		
+		thrust::for_each(
+			thrust::make_zip_iterator(
+				thrust::make_tuple(
+					(*(source.m_fftData)).begin()     + m_fftBins,
+					(*(target.m_fftData)).begin()     + m_fftBins,
+					(*m_fftData).begin()              + m_fftBins,
+					thrust::counting_iterator<int>(0) + m_fftBins)),
+			thrust::make_zip_iterator(
+				thrust::make_tuple(
+					(*(source.m_fftData)).end()       - m_fftBins,
+					(*(target.m_fftData)).end()       - m_fftBins,
+					(*m_fftData).end()                - m_fftBins,
+					thrust::counting_iterator<int>(0) +
+					this->m_fftData->size() - m_fftBins)),
+			fn1);		
+	    }
+	    complex_t tmp;
+	    tmp.x = 0;
+	    tmp.y = 0;
+	    thrust::fill((*m_fftData).begin(), (*m_fftData).begin()+m_fftBins, tmp);
+	    thrust::fill((*m_fftData).begin()+ (m_validFrameNum -1) * m_fftBins,
+			 (*m_fftData).end(), tmp);
+
+	}else{
 	    {
 		internal::PhaseGrad fn1;
 		thrust::for_each(
@@ -726,7 +983,7 @@ namespace helpers {
 					   (*(target.m_fftData)).end(),
 					   (*m_fftData).end())),
 		fn1);
-	      }
+	    }
 	}
 	
     }

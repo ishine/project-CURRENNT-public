@@ -80,6 +80,8 @@
 
 #define PI_DEFINITION 3.141592654f
 
+// for F02UV
+#define NN_OPE_F02UV_THRESHOLD 10.0 // F0 > 10Hz, voiced
 
 // CUDA functions
 namespace internal{
@@ -713,6 +715,25 @@ namespace {
 	
     };
 
+    
+    // Convert F0 (normaized) into U/V
+    //  normed_F0 * std + mean > threshold
+    //  normed_F0 > (threshod - mean) / std
+    struct normF0ToUV
+    {
+	real_t F0mean;
+	real_t F0std;
+	
+	__host__ __device__ void operator() (const thrust::tuple<real_t&, real_t&> &t) const
+	{
+	    if (t.get<0>() > ((NN_OPE_F02UV_THRESHOLD - F0mean) / F0std))
+		t.get<1>() = 1.0;
+	    else
+		t.get<1>() = 0.0;
+	}
+	
+    };
+
     // Sine signal generation (moved to FeedForwardLayer.cu)
     struct sinWaveGenerator_accum
     {
@@ -792,6 +813,26 @@ namespace {
 	}
 	
     };
+
+    // Generate the positional code
+    struct positionalCode
+    {
+	int featureDim;
+	int parallel;
+	
+	__host__ __device__ void operator() (const thrust::tuple<real_t&, int> &t) const
+	{
+	    real_t timeIdx  = (real_t)(t.get<1>() / featureDim / parallel);
+	    int dimIdx   = t.get<1>() % featureDim;
+
+	    if (dimIdx % 2 == 0)
+		t.get<0>() = sin(timeIdx / powf(10000, dimIdx / 2 * 2.0 / featureDim));
+	    else
+		t.get<0>() = cos(timeIdx / powf(10000, dimIdx / 2 * 2.0 / featureDim));
+	    
+	}
+    };
+
     
 }
 }
@@ -978,6 +1019,24 @@ namespace layers{
 	    m_setZeroVec_D.resize(this->precedingLayer().size(), 1.0);
 	}
 
+
+	/* ------ Configuration for F0 -> u/v conversion ----- */
+	m_F02UV = (layerChild->HasMember("F02UV")?
+			 (*layerChild)["F02UV"].GetInt() : 0);
+	if (m_F02UV){
+	    m_F0DataMean = (layerChild->HasMember("frequencyF0Mean")?
+			    (*layerChild)["frequencyF0Mean"].GetDouble() : 0.0);
+	    m_F0DataStd  = (layerChild->HasMember("frequencyF0Std")?
+			    (*layerChild)["frequencyF0Std"].GetDouble() : 1.0);
+	    const Configuration &config = Configuration::instance();
+	    if (config.f0dataMean_signalgen() > -1)
+		m_F0DataMean = config.f0dataMean_signalgen();
+	    if (config.f0dataStd_signalgen() > -1)
+		m_F0DataStd  = config.f0dataStd_signalgen();
+
+	    if (this->size() != 1)
+		throw std::runtime_error("Error: U/V extraction only receives 1d input");
+	}
 	
 	
 	/* ------ Configuration of the output duplication ------ */
@@ -1122,6 +1181,23 @@ namespace layers{
 	    
 	    m_noiseInput = this->outputs();
 	}
+
+	/* ------ positional encoding -------- */
+	m_positional_code_mode = (layerChild->HasMember("positional_code")?
+		     static_cast<int>((*layerChild)["positional_code"].GetDouble()) : -1);
+	if (m_positional_code_mode >= 0)
+	    printf("\tpositional code mode %d enabled", m_positional_code_mode);
+	    
+
+	/* ------ reverse gradient ----------- */
+	m_reverse_grad = (layerChild->HasMember("reverse_grad")?
+		     static_cast<real_t>((*layerChild)["reverse_grad"].GetDouble()) : -1);
+	if (m_reverse_grad >= 0){
+	    if (this->size() != this->precedingLayer().size())
+		throw std::runtime_error("reverse_grad layer size not equal to previous layer");
+	    else
+		printf("\treverse grad");
+	}
 	
 	/* ------ print the information ------ */
 
@@ -1193,6 +1269,10 @@ namespace layers{
 		throw std::runtime_error("Layer size is unequal to previous one");
 	}
 
+	if (m_F02UV)
+	    printf("\tF02UV using F0 mean and std: %f %f\n", m_F0DataMean, m_F0DataStd);
+	
+	
 	if (this->precedingLayer().getSaveMemoryFlag() &&
 	    (m_lastShot != NN_OPE_LAST_SHOT_TURNOFF || m_changeTimeRes > 0 || m_outDupRate > 1))
 	    throw std::runtime_error("Operator doesn't support memory reduce");  
@@ -1230,6 +1310,26 @@ namespace layers{
 	    (*layersArray)[layersArray->Size() - 1].AddMember("noiseDim",   m_noiseSize,
 							      allocator);
 	    (*layersArray)[layersArray->Size() - 1].AddMember("noiseRepeat",m_noiseRepeat,
+							      allocator);
+	}
+
+	if (m_F02UV){
+	    (*layersArray)[layersArray->Size() - 1].AddMember("F02UV", m_F02UV,
+							      allocator);
+	    (*layersArray)[layersArray->Size() - 1].AddMember("frequencyF0Mean", m_F0DataMean,
+							      allocator);
+	    (*layersArray)[layersArray->Size() - 1].AddMember("frequencyF0Std", m_F0DataStd,
+							      allocator);
+	}
+	    
+	if (m_positional_code_mode >= 0){
+	    (*layersArray)[layersArray->Size() - 1].AddMember("positional_code",
+							      m_positional_code_mode,
+							      allocator);
+	}
+	
+	if (m_reverse_grad >= 0){
+	    (*layersArray)[layersArray->Size() - 1].AddMember("reverse_grad", m_reverse_grad,
 							      allocator);
 	}
 
@@ -1638,6 +1738,43 @@ namespace layers{
 	       fn1);
 	       
 	    
+	}else if (m_F02UV){
+	    // convert the input F0 into U/V
+	    thrust::fill(this->outputErrors().begin(), this->outputErrors().end(), 0.0);
+	    {
+		internal::normF0ToUV fn1;
+		fn1.F0mean = m_F0DataMean;
+		fn1.F0std  = m_F0DataStd;
+		thrust::for_each(
+		  thrust::make_zip_iterator(
+			thrust::make_tuple(this->precedingLayer().outputs().begin(),
+					   this->outputs().begin())),
+		  thrust::make_zip_iterator(
+			thrust::make_tuple(this->precedingLayer().outputs().begin() + timeLength,
+					   this->outputs().begin()                  + timeLength)),
+		  fn1);
+	    }
+	    
+	}else if (m_positional_code_mode >= 0){
+	    // generate the positional code
+	    {
+	    	internal::positionalCode fn1;
+		fn1.featureDim = this->size();
+		fn1.parallel   = this->parallelSequences();
+		
+		thrust::for_each(
+		  thrust::make_zip_iterator(
+		    thrust::make_tuple(this->outputs().begin(),
+				       thrust::counting_iterator<int>(0))),
+		  thrust::make_zip_iterator(
+		    thrust::make_tuple(this->outputs().begin()     + this->size() * timeLength,
+				 thrust::counting_iterator<int>(0) + this->size() * timeLength)),
+		  fn1);
+	    }	
+	}else if (m_reverse_grad >= 0){
+	    
+	    this->outputs() = this->precedingLayer().outputs();
+	    
 	}else{
 	    // normal mode
 	    if (m_noiseSize > 0){
@@ -1917,6 +2054,29 @@ namespace layers{
 			 this->outputs().begin() + st - shiftOut);
 	    
 	    // to be finished
+	    
+	}else if (m_F02UV){
+	    {
+		internal::normF0ToUV fn1;
+		fn1.F0mean = m_F0DataMean;
+		fn1.F0std  = m_F0DataStd;
+		thrust::for_each(
+		  thrust::make_zip_iterator(
+			thrust::make_tuple(this->precedingLayer().outputs().begin() + effTimeStart,
+					   this->outputs().begin() + effTimeStart)),
+		  thrust::make_zip_iterator(
+			thrust::make_tuple(this->precedingLayer().outputs().begin() + effTimeEnd,
+					   this->outputs().begin()                  + effTimeEnd)),
+		  fn1);
+	    }
+	}else if (m_positional_code_mode >= 0){
+	    if (timeStep == 0)
+		this->computeForwardPass(nnState);
+	    
+	}else if (m_reverse_grad >=0 ){
+	    thrust::copy(this->precedingLayer().outputs().begin() + effTimeStart,
+			 this->precedingLayer().outputs().begin() + effTimeEnd,
+			 this->outputs().begin() + effTimeStart);
 	    
 	}else{
 	
@@ -2212,6 +2372,20 @@ namespace layers{
 	}else if (m_freqDim >= 0){
 	    // do nothing
 	    
+	}else if (m_positional_code_mode >= 0){
+	    // do nothing
+	    
+	}else if (m_reverse_grad >=0){
+	    
+	    thrust::transform(this->outputErrors().begin(),
+			      this->outputErrors().end(), 
+			      thrust::make_constant_iterator(-1.0 * m_reverse_grad),
+			      this->precedingLayer().outputErrors().begin(),
+			      thrust::multiplies<real_t>());
+	    
+	}else if (m_F02UV){
+	    thrust::fill(this->precedingLayer().outputErrors().begin(),
+			 this->precedingLayer().outputErrors().end(), 0.0);
 	}else{
 	    
 	    if (m_outDupRate > 1){
@@ -2344,6 +2518,16 @@ namespace layers{
 	}else if (m_freqDim >= 0){
 	    // do nothing
 	    
+	}else if (m_positional_code_mode >= 0){
+
+	}else if (m_reverse_grad >= 0){
+	    
+	    thrust::transform(this->outputErrors().begin() + effTimeStart,
+			      this->outputErrors().begin() + effTimeEnd, 
+			      thrust::make_constant_iterator(-1.0 * m_reverse_grad),
+			      this->precedingLayer().outputErrors().begin() + effTimeStart,
+			      thrust::multiplies<real_t>());
+
 	}else{
 	    
 	    if (m_outDupRate > 1){

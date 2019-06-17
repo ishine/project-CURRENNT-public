@@ -1,4 +1,9 @@
 /******************************************************************************
+ * This file is modified version 
+ * Xin WANG
+ * National Institute of Informatics, Japan
+ * 2016
+ * 
  * Copyright (c) 2013 Johannes Bergmann, Felix Weninger, Bjoern Schuller
  * Institute for Human-Machine Communication
  * Technische Universitaet Muenchen (TUM)
@@ -30,6 +35,8 @@
 #include "layers/SkipLayer.hpp"
 #include "layers/NormFlowLayer.hpp"
 #include "layers/vaeMiddleLayer.hpp"
+#include "layers/InterMetric.hpp"
+
 #include "helpers/JsonClasses.hpp"
 #include "helpers/dataProcess.hpp"
 #include "MacroDefine.hpp"
@@ -62,7 +69,7 @@
 
 #define NETWORK_WAVENET_SAVE_NO 0         // not save memory in WaveNet
 #define NETWORK_WAVENET_SAVE_AR 1         // save memory for AR WaveNet
-#define NETWORK_WAVENET_SAVE_MA 2         // save memory for MA WaveNet
+#define NETWORK_WAVENET_SAVE_MA 2         // save memory for Non-AR WaveModel
 
 /* ----- Definition for beam-search generation ----- */
 /*   Internal class defined for NeuralNetwork only   */
@@ -667,7 +674,7 @@ namespace {
 				   const int totalNumLayers,
 				   const int layerResolution)
     {
-	// A layer's memory should be NOT released in MA WaveNet when
+	// A layer's memory should be NOT released in Non-AR WaveModel when
 	//  1. this layer resolution is not at the waveform level
 	//  2. this layer is in the condition module
 	//  3. this layer will be the actual output layer
@@ -714,6 +721,7 @@ void NeuralNetwork<TDevice>::__InitializeNetworkLayerIdx(const helpers::JsonDocu
 	m_featTransNetRange.clear();
 	m_feedBackHiddenLayers.clear();
 	m_feedBackHiddenLayersTimeResos.clear();
+	m_interMetricLayers.clear();
 	
 	m_firstFeedBackLayer    = -1;     // Idx of the first feedback layer
 	m_middlePostOutputLayer = -1;     // Idx of the PostOutputLayer inside the network
@@ -806,6 +814,10 @@ void NeuralNetwork<TDevice>::__InitializeNetworkLayerIdx(const helpers::JsonDocu
 	    }else if (layerType == "feedback_hidden"){
 		// feedback layers that takes the output of hidden layers
 		m_feedBackHiddenLayers.push_back(counter);
+		
+	    }else if (layerType.compare(0, 5, "inter") == 0){
+		// intermetric layers
+		m_interMetricLayers.push_back(counter);
 		
 	    }else{
 		// do nothing
@@ -989,7 +1001,7 @@ void NeuralNetwork<TDevice>::__CreateNetworkLayers(const helpers::JsonDocument &
 				layer->reduceOutputBuffer();
 			}
 		    }else if (m_waveNetMemSaveFlag == NETWORK_WAVENET_SAVE_MA){
-			// Save the memory for MA WaveNet
+			// Save the memory for Non-AR WaveModel
 			if (internal::flagLayerCanBeOptimizedMA(
 				counter, m_signalGenLayerId[0], m_totalNumLayers,
 				layer->getResolution()))
@@ -1422,8 +1434,11 @@ void NeuralNetwork<TDevice>::printLayerDependecy()
 	BOOST_FOREACH (network_helpers::layerDep layerDep_tmp, this->m_networkMng.get_layerDeps()){
 	    BOOST_FOREACH (int towhich, layerDep_tmp.get_towhich()){
 		dotPlot::printDotNode(ofs, layerDep_tmp.get_layerID(),
+				      m_layers[layerDep_tmp.get_layerID()]->name(),
 				      m_layers[layerDep_tmp.get_layerID()]->type(),
-				      towhich, m_layers[towhich]->type());
+				      towhich,
+				      m_layers[towhich]->name(),
+				      m_layers[towhich]->type());
 	    }
 	}
 	dotPlot::printDotEnd(ofs);
@@ -2092,7 +2107,7 @@ void NeuralNetwork<TDevice>::__computeGenPass_LayerByLayer_mem(
     // Make a copy of the network layer dependency
     network_helpers::networkDepMng tmp_networkMng = this->m_networkMng;
 	
-    // mem save generation mode for MA WaveNet
+    // mem save generation mode for Non-AR WaveModel
     int layerID = 0;
     BOOST_FOREACH (boost::shared_ptr<layers::Layer<TDevice> > &layer, m_layers){
 
@@ -3200,6 +3215,22 @@ real_t NeuralNetwork<TDevice>::calculateError(const bool flagGenerateMainError) 
 	    }	    
 	    return tmpError;
 	}
+	
+    }else if (!m_interMetricLayers.empty()){
+	
+	// With intermediate metrics
+	if(flagGenerateMainError){
+	    return static_cast<layers::PostOutputLayer<TDevice>&>(
+			*m_layers.back()).calculateError();
+	}else{
+	    real_t tmpError = 0.0;
+	    BOOST_FOREACH (int layerID, m_interMetricLayers){
+		tmpError += static_cast<layers::InterMetricLayer<TDevice>&>(
+					*m_layers[layerID]).calculateError();
+	    }	    
+	    return tmpError;
+	}
+	
     }else{
 	// Normal network
 	if(flagGenerateMainError)
